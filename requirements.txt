@@ -1,0 +1,27 @@
+# Core
+llama-index>=0.13.0
+llama-index-core>=0.13.0
+llama-index-llms-ollama>=0.1.0
+llama-index-embeddings-huggingface>=0.1.0
+llama-index-vector-stores-faiss>=0.1.0
+faiss-cpu>
+pandas>=2.0.0
+tabulate
+ipywidgets>=8.1.7
+jupyter
+
+# Embeddings + Reranker
+sentence-transformers>=2.2.0
+
+# LLM backend
+ollama>=0.1.0
+
+# Data processing
+tqdm
+numpy>=1.24.0
+
+# File format support
+python-docx # Word DOCX files
+PyMuPDF     # PDF files
+
+
