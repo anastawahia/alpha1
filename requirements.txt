@@ -4,7 +4,7 @@ llama-index-core>=0.13.0
 llama-index-llms-ollama>=0.1.0
 llama-index-embeddings-huggingface>=0.1.0
 llama-index-vector-stores-faiss>=0.1.0
-faiss-cpu>
+faiss-cpu
 pandas>=2.0.0
 tabulate
 ipywidgets>=8.1.7
