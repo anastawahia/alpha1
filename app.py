@@ -350,21 +350,149 @@ def ensure_index(persist_dir: Path = STORAGE_DIR) -> VectorStoreIndex:
 # =============================
 # Query helpers
 # =============================
-def ask(query: str, top_k: int = 5) -> str:
-    """
-    Simple query function across all indexed data.
-    - query: the query text
-    - top_k: number of results to retrieve
-    """
-    idx = ensure_index(STORAGE_DIR)
+from typing import Optional
 
-    qe = idx.as_query_engine(similarity_top_k=top_k)
+def ask_one(
+    query: str,
+    top_k: int = 6,
+    include_sources: bool | str = True,       # True | False | "json"
+    restrict: Optional[str] = None,           # None | "excel" | "csv" | "unstructured" | "all"
+    file: Optional[str] = None,               # filter by file name (substring match)
+    sheet: Optional[str] = None               # Excel only (exact match, case-insensitive/trimmed)
+) -> str | dict:
+    """
+    Unified query across all sources with safer filtering and consistent outputs.
+    - include_sources: True -> append text, "json" -> return dict, False -> answer only.
+    """
+    def _norm(x: Optional[str]) -> str:
+        return (x or "").casefold().strip()
 
     try:
-        resp = qe.query(query)
-        return str(resp)
+        idx = ensure_index(STORAGE_DIR)
     except Exception as e:
-        return f"Error during query: {str(e)}"
+        return f"Error initializing index: {e}"
+
+    # Detect if we will apply any filters
+    will_filter = any([restrict, file, sheet])
+    # Adaptive fetch: pull more when filters are present to avoid empty post-filter sets
+    fetch_k = top_k if not will_filter else max(top_k * 5, 50)
+
+    try:
+        qe = idx.as_query_engine(similarity_top_k=fetch_k)
+        resp = qe.query(query)
+    except Exception as e:
+        return f"Error during query: {e}"
+
+    # If no source_nodes attribute or empty, just return the response
+    src_nodes = getattr(resp, "source_nodes", None)
+    if not src_nodes:
+        return str(resp)
+
+    # Allowed types map
+    type_map = {
+        "excel": {"structured_excel_sheet"},
+        "csv": {"structured_csv"},
+        "unstructured": {"unstructured_doc"},
+        "all": {"structured_excel_sheet", "structured_csv", "unstructured_doc"},
+        None: {"structured_excel_sheet", "structured_csv", "unstructured_doc"},
+    }
+    allowed_types = type_map.get(restrict) or type_map[None]
+
+    file_norm = _norm(file) if file else None
+    sheet_norm = _norm(sheet) if sheet else None
+
+    filtered = []
+    for sn in src_nodes:
+        md = getattr(sn.node, "metadata", {}) or {}
+        ntype = md.get("type")
+        if ntype not in allowed_types:
+            continue
+
+        # Normalize source path/name
+        src_val = md.get("source") or md.get("file_name") or md.get("source_path") or ""
+        src_norm = _norm(src_val)
+
+        if file_norm and (file_norm not in src_norm):
+            continue
+
+        if sheet_norm:
+            if _norm(md.get("sheet_name")) != sheet_norm:
+                continue
+
+        filtered.append(sn)
+
+    # If filtering is active, override with filtered nodes; else keep original
+    final_nodes = filtered if will_filter else list(src_nodes)
+    final_nodes = final_nodes[:top_k]
+
+    # If filters wiped everything, return a clear message
+    if will_filter and not final_nodes:
+        return "No results after applying filters."
+
+    # Force consistency: attach pruned nodes back
+    try:
+        resp.source_nodes = final_nodes
+    except Exception:
+        pass  # be tolerant if resp is immutable
+
+    # Prefer .response if available (LlamaIndex), else str()
+    answer_text = getattr(resp, "response", None) or str(resp)
+
+    if not include_sources:
+        return answer_text
+
+        # Build unique, aggregated sources (no repetition)
+    from math import inf
+
+    aggregates = {}  # key: (type, source, sheet) -> {"count": int, "best_score": float|None}
+    for n in final_nodes:
+        md = getattr(n.node, "metadata", {}) or {}
+        src = md.get("source") or md.get("file_name") or md.get("source_path")
+        key = (md.get("type"), src, md.get("sheet_name"))
+
+        entry = aggregates.get(key)
+        if not entry:
+            aggregates[key] = {"count": 1, "best_score": getattr(n, "score", None)}
+        else:
+            entry["count"] += 1
+            s = getattr(n, "score", None)
+            if s is not None:
+                # Keep the "best" score: if your score is distance, smaller is better;
+                # if it's similarity, larger is better. Adjust comparator if needed.
+                if entry["best_score"] is None:
+                    entry["best_score"] = s
+                else:
+                    # Assuming distance-like score (smaller is better). Flip if opposite.
+                    if s < entry["best_score"]:
+                        entry["best_score"] = s
+
+    # Convert to a stable, ranked list
+    uniq_sources = []
+    for (t, src, sh), info in aggregates.items():
+        uniq_sources.append({
+            "type": t,
+            "source": src,
+            "sheet": sh,
+            "hits": info["count"],
+            "best_score": info["best_score"],
+        })
+
+    # Optional: sort by best_score if available, else by hits desc
+    uniq_sources.sort(key=lambda x: (x["best_score"] is None, x["best_score"], -x["hits"]))
+
+    if include_sources == "json":
+        return {
+            "answer": answer_text,
+            "sources": uniq_sources
+        }
+
+    # Text appendix (deduplicated)
+    lines = ["", "=== Sources ==="]
+    for i, s in enumerate(uniq_sources, 1):
+        lines.append(
+            f"{i}. type={s['type']} | source={s['source']} | sheet={s['sheet']} | hits={s['hits']} | best_score={s['best_score']}"
+        )
+    return answer_text + "\n" + "\n".join(lines)
 
 
 # =============================
@@ -493,4 +621,4 @@ if __name__ == "__main__":
     verify_coverage(verbose=True)
     
     print("\nExample query:")
-    print(ask("tell me about the boiler operation procedures"))
+    print(ask_one("tell me about the boiler operation procedures"))
