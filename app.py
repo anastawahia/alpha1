@@ -63,7 +63,7 @@ OLLAMA_GPU_KW = {
 
 # Configure LLM settings with Ollama (GPU-enabled via additional_kwargs)
 Settings.llm = Ollama(
-    model="llama3.2:1b",
+    model="llama3.2:1b",  # Default model; can be changed dynamically via set_model()
     request_timeout=90.0,   # Slightly reduced due to expected acceleration
     temperature=0.1,
     additional_kwargs=OLLAMA_GPU_KW,
@@ -209,119 +209,112 @@ def load_unstructured_docs() -> List[Document]:
         out.append(Document(text=d.text, metadata=md))
     return out
 
+#============================
+# Resolve source path from metadata
+#============================
+
+from pathlib import Path
+from typing import Optional
+
+def _resolve_source_to_path(md: dict) -> Optional[Path]:
+    """
+    يحاول استخراج المسار من الميتاداتا:
+    - يفضّل 'source_path' أو 'file_path'
+    - وإلا يبحث بالاسم 'source' داخل مجلد UNSTRUCTURED_DIR
+    """
+    sp = md.get("source_path") or md.get("file_path")
+    if sp:
+        try:
+            p = Path(sp)
+            if p.exists():
+                return p
+        except Exception:
+            pass
+
+    name = md.get("source") or md.get("file_name") or md.get("filename")
+    if not name:
+        return None
+
+    # ابحث عن الملف بالاسم داخل مجلد unstructured
+    for cand in UNSTRUCTURED_DIR.rglob(name):
+        return cand
+
+    return None
+
 
 # =============================
 # Build / Persist index
 # =============================
-def _resolve_source_to_path(md: dict) -> Optional[Path]:
-    """Resolve a file path from document metadata. Prefer 'source_path'; fallback to searching by name."""
-    sp = md.get("source_path")
-    if sp and Path(sp).exists():
-        return Path(sp)
-    name = md.get("source")
-    if not name:
-        return None
-    candidates = list(UNSTRUCTURED_DIR.rglob(name))
-    return candidates[0] if candidates else None
-
 
 def build_or_update_index(persist_dir: Path = STORAGE_DIR) -> VectorStoreIndex:
-    """Build/Update a FAISS index from (Unstructured) incrementally using a manifest."""
     u_docs = load_unstructured_docs()
-    all_docs = u_docs 
+    all_docs = u_docs
     if not all_docs:
-        raise RuntimeError(
-            "No documents available for indexing.\n"
-            f"- Or PDF/TXT/DOCX/MD files in: {UNSTRUCTURED_DIR}\n"
-        )
+        raise RuntimeError("No documents available for indexing.")
 
-    print("Creating fresh storage...")
-
-    fresh = True
     try:
-        existing_index = _load_index(persist_dir)
-        fresh = False
-    except Exception:
-        existing_index = None
-        fresh = True
+        # load existing -> تحديث تدريجي
+        index = _load_index(persist_dir)
+        manifest = load_manifest()
+        changed_docs = []
+        for d in all_docs:
+            md = d.metadata or {}
+            src = md.get("source_path") or md.get("file_path") or md.get("source") or ""
+            pth = Path(src) if src else None
+            if pth and pth.exists():
+                fp = file_fingerprint(pth)
+                old = manifest.get(str(pth.resolve()))
+                if (not old) or (old.get("fingerprint") != fp):
+                    changed_docs.append(d)
 
-    if fresh:
-        print("Creating fresh storage...")
+        if changed_docs:
+            print(f"Inserting/refreshing {len(changed_docs)} docs...")
+            index.refresh_ref_docs(changed_docs)         # <-- البديل الصحيح
+            index.storage_context.persist(persist_dir=str(persist_dir))
+
+        # حدّث الـmanifest لكل الملفات (الجديدة/المعدلة)
+        for doc in all_docs:
+            md = doc.metadata or {}
+            src_path = _resolve_source_to_path(md)
+            if src_path and src_path.exists():
+                manifest[str(src_path.resolve())] = {
+                    "fingerprint": file_fingerprint(src_path),
+                    "last_indexed": int(time.time()),
+                }
+        save_manifest(manifest)
+        print("Index updated & persisted.")
+        return index
+
+    except Exception:
+        # لا يوجد فهرس: نبنيه من الصفر مرة واحدة فقط
         probe_vec = Settings.embed_model.get_query_embedding("dimension probe")
         embed_dim = len(probe_vec)
-        print(f"Using embedding dimension: {embed_dim}")
         faiss_idx = faiss.IndexHNSWFlat(embed_dim, 32)
         faiss_idx.hnsw.efConstruction = 200
         faiss_idx.hnsw.efSearch = 64
         vs = FaissVectorStore(faiss_index=faiss_idx)
         storage_context = StorageContext.from_defaults(vector_store=vs)
-        print("Storage initialized with empty FAISS-HNSW index.")
-        print("Creating new index...")
+
         index = VectorStoreIndex.from_documents(
             all_docs,
             storage_context=storage_context,
             show_progress=True,
             transformations=[SentenceSplitter(chunk_size=700, chunk_overlap=70)],
         )
-    else:
-        print("Incremental update: loading existing index and inserting changed docs only...")
-        index = existing_index
-        manifest = load_manifest()
-        changed_docs = []
-        for d in all_docs:
-            md = d.metadata or {}
-            src = md.get("source_path") or md.get("file_path") or md.get("source") or ""
-            try:
-                pth = Path(src)
-            except Exception:
-                pth = None
-            if pth and pth.exists():
-                fp = file_fingerprint(pth)
-                old = manifest.get(str(pth.resolve()))
-                if (not old) or (old.get("fingerprint") != fp):
-                    changed_docs.append(d)
-        if changed_docs:
-            print(f"Inserting {len(changed_docs)} changed/new docs...")
-            index.insert_documents(changed_docs)
-        else:
-            print("No changes detected; index is up to date.")
 
-    probe_vec = Settings.embed_model.get_query_embedding("dimension probe")
-    embed_dim = len(probe_vec)
-    print(f"Using embedding dimension: {embed_dim}")
-    faiss_idx = faiss.IndexHNSWFlat(embed_dim, 32)
-    faiss_idx.hnsw.efConstruction = 200
-    faiss_idx.hnsw.efSearch = 64
-    vs = FaissVectorStore(faiss_index=faiss_idx)
-    storage_context = StorageContext.from_defaults(vector_store=vs)
-    print("Storage initialized with empty FAISS index.")
-    print("Creating new index...")
-
-    index = VectorStoreIndex.from_documents(
-        documents=all_docs,
-        storage_context=storage_context,
-        show_progress=True,
-        use_async=False  
-    )
-
-    manifest = load_manifest()
-
-    print(f"\nProcessing {len(all_docs)} documents...")
-
-    for doc in all_docs:
-        md = getattr(doc, "metadata", {}) or {}
-        src_path = _resolve_source_to_path(md)
-        if src_path and src_path.exists():
-            key = str(src_path.resolve())
-            manifest[key] = {
-                "fingerprint": file_fingerprint(src_path),
-                "last_indexed": int(time.time()),
-            }
-
-    save_manifest(manifest)
-    storage_context.persist(persist_dir=str(persist_dir))
-    print("Index built and persisted.")
-    return index
+        manifest = {}
+        for doc in all_docs:
+            md = doc.metadata or {}
+            src_path = _resolve_source_to_path(md)
+            if src_path and src_path.exists():
+                manifest[str(src_path.resolve())] = {
+                    "fingerprint": file_fingerprint(src_path),
+                    "last_indexed": int(time.time()),
+                }
+        save_manifest(manifest)
+        storage_context.persist(persist_dir=str(persist_dir))
+        print("Fresh index built & persisted.")
+        return index
 
 
 # =============================
